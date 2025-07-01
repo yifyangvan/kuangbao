@@ -1,176 +1,232 @@
-// 优化说明：
-// - 减少全局变量使用，封装逻辑模块
-// - 异常处理清晰化，提升稳定性
-// - 提取冗余逻辑为函数，增强可维护性
-// - 精简数据处理逻辑
-// - 减少同步分支、采用懒处理和异步优化
-// - 不影响原有接口设计和功能
+// ====================================================================
+// Cloudflare Worker: VL over WebSocket + NAT64 + 兜底
+// --------------------------------------------------------------------
+// 环境变量 (Vars) 说明：
+//   UUID         必填，VL 用户的 UUID                         例：173eb8bd-7154-4e20-91ec-dfadaf1f632b
+//   ID           可选，订阅路径 (默认 242222)                   例：myvless
+//   PROXYIP      可选，反代兜底地址 "ip:port" 或 "host:port"  例：203.0.113.9:443
+//   NAT64        可选，是否启用 NAT64 (true|false，默认 true)   例：false
+//   启用反代功能  可选，true|false (默认 true)，是否启用反代兜底
+// ====================================================================
+// 如使用 wrangler 部署，可在 wrangler.toml 中：
+// [vars]
+// UUID = "173eb8bd-7154-4e20-91ec-dfadaf1f632b"
+// NAT64 = "false"
+// PROXYIP = "proxyip.zone.id"
+// --------------------------------------------------------------------
 
 import { connect } from 'cloudflare:sockets';
 
-const SYMBOL = '://';
+let 转码 = 'vl', 转码2 = 'ess', 符号 = '://';
 
-function parseEnv(name, fallback, env) {
+//////////////////////////////////////////////////////////////////////////配置区块////////////////////////////////////////////////////////////////////////
+let 哎呀呀这是我的ID啊 = "242222";          // 订阅路径
+let 哎呀呀这是我的VL密钥 = "d26432c5-a84b-47c3-aaf8-b949f326efb3"; // UUID
+
+let 我的优选 = ['104.16.160.145'];
+let 我的优选TXT = [];
+
+let 启用反代功能 = true;
+let 反代IP = 'sjc.o00o.ooo:443';
+
+let NAT64 = false;       // 默认开启 NAT64
+
+let 我的节点名字 = '狂暴';
+
+const 读取环境变量 = (name, fallback, env) => {
   const raw = import.meta?.env?.[name] ?? env?.[name];
-  if (!raw || typeof raw !== 'string') return fallback;
-  const trimmed = raw.trim();
-  if (trimmed === 'true') return true;
-  if (trimmed === 'false') return false;
-  if (trimmed.includes('\n')) return trimmed.split('\n').map(x => x.trim()).filter(Boolean);
-  if (!isNaN(trimmed)) return Number(trimmed);
-  return trimmed;
+  if (raw === undefined || raw === null || raw === '') return fallback;
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (trimmed === 'true') return true;
+    if (trimmed === 'false') return false;
+    if (trimmed.includes('\n')) {
+      return trimmed.split('\n').map(item => item.trim()).filter(Boolean);
+    }
+    if (!isNaN(trimmed) && trimmed !== '') return Number(trimmed);
+    return trimmed;
+  }
+  return raw;
+};
+
+/* ---------- NAT64 工具 ---------- */
+function convertToNAT64IPv6(ipv4) {
+  const parts = ipv4.split('.');
+  if (parts.length !== 4) throw new Error('无效的IPv4地址');
+  const hex = parts.map(p => Number(p).toString(16).padStart(2, '0'));
+  return `[2001:67c:2960:6464::${hex[0]}${hex[1]}:${hex[2]}${hex[3]}]`;
 }
 
-function convertToNAT64(ipv4) {
-  const parts = ipv4.split('.').map(p => parseInt(p).toString(16).padStart(2, '0'));
-  return `[2001:67c:2960:6464::${parts[0]}${parts[1]}:${parts[2]}${parts[3]}]`;
-}
-
-async function resolveNAT64(domain) {
-  const res = await fetch(`https://1.1.1.1/dns-query?name=${domain}&type=A`, {
-    headers: { 'Accept': 'application/dns-json' },
+async function getIPv6ProxyAddress(domain) {
+  const r = await fetch(`https://1.1.1.1/dns-query?name=${domain}&type=A`, {
+    headers: { 'Accept': 'application/dns-json' }
   });
-  const json = await res.json();
-  const ipv4 = json.Answer?.find(r => r.type === 1)?.data;
-  if (!ipv4) throw new Error('NAT64解析失败');
-  return convertToNAT64(ipv4);
-}
-
-function decodeUUID(bytes) {
-  return [...bytes].map(b => b.toString(16).padStart(2, '0')).join('').replace(/(.{8})(.{4})(.{4})(.{4})(.{12})/, '$1-$2-$3-$4-$5');
-}
-
-function decodeBase64url(input) {
-  input = input.replace(/-/g, '+').replace(/_/g, '/');
-  return Uint8Array.from(atob(input), c => c.charCodeAt(0)).buffer;
-}
-
-function makeSubConfig(host, uuid, nodes, nodeName) {
-  return nodes.map(item => {
-    const [main, tls] = item.split('@');
-    const [addr, name = nodeName] = main.split('#');
-    const [ip, port = '443'] = addr.split(':');
-    const tlsStr = tls === 'notls' ? 'security=none' : 'security=tls';
-    return `vless${SYMBOL}vless${SYMBOL}${uuid}@${ip}:${port}?encryption=none&${tlsStr}&sni=${host}&type=ws&host=${host}&path=%2F%3Fed%3D2560#${name}`;
-  }).join('\n');
-}
-
-async function forwardWebSocket(request, tcp, initData) {
-  const [client, server] = new WebSocketPair();
-  server.accept();
-  const writer = tcp.writable.getWriter();
-  const reader = tcp.readable.getReader();
-  if (initData) await writer.write(initData);
-  server.addEventListener('message', e => writer.write(e.data));
-  (async () => {
-    try {
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        server.send(value);
-      }
-    } catch {} finally {
-      try { server.close(); } catch {}
-      try { reader.cancel(); } catch {}
-      try { writer.releaseLock(); } catch {}
-      tcp.close();
-    }
-  })();
-  return new Response(null, { status: 101, webSocket: client });
-}
-
-async function handleVLConnection(data, env, fallbackHost, fallbackPort) {
-  const view = new DataView(data);
-  const type = new Uint8Array(data)[17];
-  const port = view.getUint16(18 + type + 1);
-  let offset = 18 + type + 4;
-  let host;
-
-  switch (new Uint8Array(data)[offset - 1]) {
-    case 1:
-      host = [...new Uint8Array(data).slice(offset, offset + 4)].join('.');
-      offset += 4;
-      break;
-    case 2: {
-      const len = new Uint8Array(data)[offset];
-      host = new TextDecoder().decode(new Uint8Array(data).slice(offset + 1, offset + 1 + len));
-      offset += len + 1;
-      break;
-    }
-    default:
-      host = Array.from({ length: 8 }, (_, i) => view.getUint16(offset + i * 2).toString(16)).join(':');
-      offset += 16;
-  }
-
-  const init = data.slice(offset);
-
-  try {
-    const sock = await connect({ hostname: host, port });
-    await sock.opened;
-    return { tcpSocket: sock, initialData: init };
-  } catch {}
-
-  if (env.NAT64) {
-    try {
-      const target = /\./.test(host) ? convertToNAT64(host) : await resolveNAT64(host);
-      const sock = await connect({ hostname: target.replace(/[[\]]/g, ''), port });
-      await sock.opened;
-      return { tcpSocket: sock, initialData: init };
-    } catch {}
-  }
-
-  if (!env.启用反代功能 || !fallbackHost) throw new Error('连接失败');
-  const sock = await connect({ hostname: fallbackHost, port: fallbackPort || port });
-  await sock.opened;
-  return { tcpSocket: sock, initialData: init };
+  const j = await r.json();
+  const a = j.Answer?.find(x => x.type === 1);
+  if (!a) throw new Error('无法解析域名的IPv4地址');
+  return convertToNAT64IPv6(a.data);
 }
 
 export default {
-  async fetch(req, env) {
-    const upgrade = req.headers.get('Upgrade');
-    const url = new URL(req.url);
-    const ID = parseEnv('ID', '242222', env);
-    const UUID = parseEnv('UUID', 'd26432c5-a84b-47c3-aaf8-b949f326efb3', env);
-    const myTXT = parseEnv('TXT', [], env);
-    const myIP = parseEnv('IP', ['104.16.160.145'], env);
-    const fallback = parseEnv('PROXYIP', 'sjc.o00o.ooo:443', env);
-    const NAT64 = parseEnv('NAT64', true, env);
-    const enableProxy = parseEnv('启用反代功能', true, env);
-    const nodeName = parseEnv('我的节点名字', '狂暴', env);
+  async fetch(访问请求, env) {
+    哎呀呀这是我的ID啊   = 读取环境变量('ID',           哎呀呀这是我的ID啊, env);
+    哎呀呀这是我的VL密钥 = 读取环境变量('UUID',         哎呀呀这是我的VL密钥, env);
+    我的优选           = 读取环境变量('IP',           我的优选,           env);
+    我的优选TXT        = 读取环境变量('TXT',          我的优选TXT,        env);
+    反代IP             = 读取环境变量('PROXYIP',      反代IP,             env);
+    启用反代功能       = 读取环境变量('启用反代功能', 启用反代功能,     env);
+    NAT64            = 读取环境变量('NAT64',        NAT64,              env);
+    我的节点名字       = 读取环境变量('我的节点名字',   我的节点名字,       env);
 
-    const fallbackParts = fallback.split(':');
-    const fallbackHost = fallbackParts[0];
-    const fallbackPort = Number(fallbackParts[1]) || 443;
+    const 升级标头 = 访问请求.headers.get('Upgrade');
+    const url = new URL(访问请求.url);
 
-    if (!upgrade || upgrade !== 'websocket') {
-      let resolvedIP = Array.isArray(myIP) ? myIP : [myIP];
-      for (const txt of Array.isArray(myTXT) ? myTXT : [myTXT]) {
-        try {
-          const res = await fetch(txt);
-          const lines = (await res.text()).split('\n').map(x => x.trim()).filter(Boolean);
-          resolvedIP.push(...lines);
-        } catch {}
+    if (!升级标头 || 升级标头 !== 'websocket') {
+      /* ---- 订阅/普通响应代码 ---- */
+      if (我的优选TXT) {
+        const 链接数组 = Array.isArray(我的优选TXT) ? 我的优选TXT : [我的优选TXT];
+        const 所有节点 = [];
+        for (const 链接 of 链接数组) {
+          try {
+            const 响应 = await fetch(链接);
+            const 文本 = await 响应.text();
+            const 节点 = 文本.split('\n').map(line => line.trim()).filter(line => line);
+            所有节点.push(...节点);
+          } catch (e) {
+            console.warn(`无法获取或解析链接: ${链接}`, e);
+          }
+        }
+        if (所有节点.length > 0) 我的优选 = 所有节点;
       }
       switch (url.pathname) {
-        case `/${ID}`:
-          return new Response(`\n订阅地址: https${SYMBOL}${req.headers.get('Host')}/${ID}/vless\n`, { status: 200 });
-        case `/${ID}/vless`:
-          resolvedIP.push(`${req.headers.get('Host')}:443`);
-          return new Response(makeSubConfig(req.headers.get('Host'), UUID, resolvedIP, nodeName), {
-            status: 200,
-            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        case `/${哎呀呀这是我的ID啊}`:
+          return new Response(给我订阅页面(哎呀呀这是我的ID啊, 访问请求.headers.get('Host')), {
+            status: 200, headers: { "Content-Type": "text/plain;charset=utf-8" }
+          });
+        case `/${哎呀呀这是我的ID啊}/${转码}${转码2}`:
+          return new Response(给我通用配置文件(访问请求.headers.get('Host')), {
+            status: 200, headers: { "Content-Type": "text/plain;charset=utf-8" }
           });
         default:
           return new Response('Hello World!', { status: 200 });
       }
     } else {
-      const secproto = req.headers.get('sec-websocket-protocol');
-      const raw = decodeBase64url(secproto);
-      if (decodeUUID(new Uint8Array(raw.slice(1, 17))) !== UUID) {
+      const enc = 访问请求.headers.get('sec-websocket-protocol');
+      const data = 使用64位加解密(enc);
+      if (验证VL的密钥(new Uint8Array(data.slice(1, 17))) !== 哎呀呀这是我的VL密钥) {
         return new Response('无效的UUID', { status: 403 });
       }
-      const conn = await handleVLConnection(raw, { NAT64, 启用反代功能: enableProxy }, fallbackHost, fallbackPort);
-      return await forwardWebSocket(req, conn.tcpSocket, conn.initialData);
+      const { tcpSocket, initialData } = await 解析VL标头(data);
+      return await 升级WS请求(访问请求, tcpSocket, initialData);
     }
   }
 };
+
+async function 升级WS请求(访问请求, tcpSocket, initialData) {
+  const { 0: 客户端, 1: WS接口 } = new WebSocketPair();
+  WS接口.accept();
+  建立传输管道(WS接口, tcpSocket, initialData);
+  return new Response(null, { status: 101, webSocket: 客户端 });
+}
+
+function 使用64位加解密(str) {
+  str = str.replace(/-/g, '+').replace(/_/g, '/');
+  return Uint8Array.from(atob(str), c => c.charCodeAt(0)).buffer;
+}
+
+async function 解析VL标头(buf) {
+  const b = new DataView(buf), c = new Uint8Array(buf);
+  const addrTypeIndex = c[17];
+  const port = b.getUint16(18 + addrTypeIndex + 1);
+  let offset = 18 + addrTypeIndex + 4;
+  let host;
+  if (c[offset - 1] === 1) {
+    host = Array.from(c.slice(offset, offset + 4)).join('.');
+    offset += 4;
+  } else if (c[offset - 1] === 2) {
+    const len = c[offset];
+    host = new TextDecoder().decode(c.slice(offset + 1, offset + 1 + len));
+    offset += len + 1;
+  } else {
+    const dv = new DataView(buf);
+    host = Array(8).fill().map((_, i) => dv.getUint16(offset + 2 * i).toString(16)).join(':');
+    offset += 16;
+  }
+  const initialData = buf.slice(offset);
+
+  /* --------- 1. 直连 --------- */
+  try {
+    const tcpSocket = await connect({ hostname: host, port });
+    await tcpSocket.opened;
+    return { tcpSocket, initialData };
+  } catch { /* ignore */ }
+
+  /* --------- 2. NAT64 --------- */
+  if (NAT64) {
+    try {
+      let natTarget;
+      if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
+        natTarget = convertToNAT64IPv6(host);
+      } else if (host.includes(':')) {
+        throw new Error('IPv6 地址无需 NAT64');
+      } else {
+        natTarget = await getIPv6ProxyAddress(host);
+      }
+      const natSock = await connect({ hostname: natTarget.replace(/^\[|\]$/g, ''), port });
+      await natSock.opened;
+      return { tcpSocket: natSock, initialData };
+    } catch { /* ignore */ }
+  }
+
+  /* --------- 3. 反代兜底 --------- */
+  if (!启用反代功能 || !反代IP) throw Error('连接失败');
+  const [h, p] = 反代IP.split(':');
+  const tcpSocket = await connect({ hostname: h, port: Number(p) || port });
+  await tcpSocket.opened;
+  return { tcpSocket, initialData };
+}
+
+async function 建立传输管道(ws, tcp, init) {
+  ws.send(new Uint8Array([0, 0]));
+  const writer = tcp.writable.getWriter();
+  const reader = tcp.readable.getReader();
+  if (init) await writer.write(init);
+  ws.addEventListener('message', e => writer.write(e.data));
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value) ws.send(value);
+    }
+  } finally {
+    try { ws.close(); } catch {}
+    try { reader.cancel(); } catch {}
+    try { writer.releaseLock(); } catch {}
+    tcp.close();
+  }
+}
+
+function 验证VL的密钥(a) {
+  const hex = Array.from(a, v => v.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
+}
+
+function 给我订阅页面(ID, host) {
+  return `
+订阅地址: https${符号}${host}/${ID}/${转码}${转码2}
+`;
+}
+
+function 给我通用配置文件(host) {
+  我的优选.push(`${host}:443`);
+
+  return 我的优选.map(item => {
+    const [main, tls] = item.split("@");
+    const [addrPort, name = 我的节点名字] = main.split("#");
+    const parts = addrPort.split(":");
+    const port = parts.length > 1 ? Number(parts.pop()) : 443;
+    const addr = parts.join(":");
+    const tlsOpt = tls === 'notls' ? 'security=none' : 'security=tls';
+    return `${转码}${转码2}${符号}${哎呀呀这是我的VL密钥}@${addr}:${port}?encryption=none&${tlsOpt}&sni=${host}&type=ws&host=${host}&path=%2F%3Fed%3D2560#${name}`;
+  }).join("\n");
+}
