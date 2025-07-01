@@ -130,10 +130,10 @@ export default {
     const upgrade = req.headers.get('Upgrade');
     const url = new URL(req.url);
     const ID = parseEnv('ID', '242222', env);
-    const UUID = parseEnv('UUID', '', env);
+    const UUID = parseEnv('UUID', 'd26432c5-a84b-47c3-aaf8-b949f326efb3', env);
     const myTXT = parseEnv('TXT', [], env);
     const myIP = parseEnv('IP', ['104.16.160.145'], env);
-    const fallback = parseEnv('PROXYIP', '', env);
+    const fallback = parseEnv('PROXYIP', 'sjc.o00o.ooo:443', env);
     const NAT64 = parseEnv('NAT64', true, env);
     const enableProxy = parseEnv('启用反代功能', true, env);
     const nodeName = parseEnv('我的节点名字', '狂暴', env);
