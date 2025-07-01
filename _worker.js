@@ -30,7 +30,7 @@ function 初始化配置(env) {
     TXT: 读取环境变量('TXT', [], env),
     PROXYIP: 读取环境变量('PROXYIP', 'sjc.o00o.ooo:443', env),
     启用反代功能: 读取环境变量('启用反代功能', true, env),
-    NAT64: 读取环境变量('NAT64', false, env),
+    NAT64: 读取环境变量('NAT64', true, env),
     我的节点名字: 读取环境变量('我的节点名字', '狂暴', env),
   };
   return ENV_CACHE;
