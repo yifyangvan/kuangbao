@@ -3,6 +3,7 @@ import { connect } from 'cloudflare:sockets';
 let 转码 = 'vl', 转码2 = 'ess', 符号 = '://';
 
 let ENV_CACHE = null;
+const decoder = new TextDecoder(); // ✅ 优化：TextDecoder 实例只创建一次
 
 function 读取环境变量(name, fallback, env) {
   const raw = import.meta?.env?.[name] ?? env?.[name];
@@ -30,7 +31,7 @@ function 初始化配置(env) {
     TXT: 读取环境变量('TXT', [], env),
     PROXYIP: 读取环境变量('PROXYIP', 'sjc.o00o.ooo:443', env),
     启用反代功能: 读取环境变量('启用反代功能', true, env),
-    NAT64: 读取环境变量('NAT64', true, env),
+    NAT64: 读取环境变量('NAT64', false, env),
     我的节点名字: 读取环境变量('我的节点名字', '狂暴', env),
   };
   return ENV_CACHE;
@@ -107,7 +108,7 @@ async function 解析VL标头(buf, cfg) {
     offset += 4;
   } else if (c[offset - 1] === 2) {
     const len = c[offset];
-    host = new TextDecoder().decode(c.slice(offset + 1, offset + 1 + len));
+    host = decoder.decode(c.slice(offset + 1, offset + 1 + len));  // ✅ 优化后调用
     offset += len + 1;
   } else {
     host = Array(8).fill().map((_, i) => b.getUint16(offset + 2 * i).toString(16)).join(':');
@@ -115,16 +116,12 @@ async function 解析VL标头(buf, cfg) {
   }
   const initialData = buf.slice(offset);
 
-  // IPv6 直连尝试
   try {
     const sock = await connect({ hostname: host, port });
     await sock.opened;
     return { tcpSocket: sock, initialData };
-  } catch (e) {
-    // fallback
-  }
+  } catch (e) {}
 
-  // NAT64 尝试
   if (cfg.NAT64) {
     try {
       let natTarget;
@@ -138,12 +135,9 @@ async function 解析VL标头(buf, cfg) {
       const sock = await connect({ hostname: natTarget.replace(/^\[|\]$/g, ''), port });
       await sock.opened;
       return { tcpSocket: sock, initialData };
-    } catch (e) {
-      // fallback
-    }
+    } catch (e) {}
   }
 
-  // 反代尝试
   if (cfg.启用反代功能 && cfg.PROXYIP) {
     const [代理主机, 代理端口] = cfg.PROXYIP.split(':');
     const portNum = Number(代理端口) || port;
