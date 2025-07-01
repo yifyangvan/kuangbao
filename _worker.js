@@ -132,7 +132,7 @@ export default {
     const ID = parseEnv('ID', '242222', env);
     const UUID = parseEnv('UUID', '', env);
     const myTXT = parseEnv('TXT', [], env);
-    const myIP = parseEnv('IP', [], env);
+    const myIP = parseEnv('IP', ['104.16.160.145'], env);
     const fallback = parseEnv('PROXYIP', '', env);
     const NAT64 = parseEnv('NAT64', true, env);
     const enableProxy = parseEnv('启用反代功能', true, env);
