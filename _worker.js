@@ -3,7 +3,7 @@ import { connect } from 'cloudflare:sockets';
 let 转码 = 'vl', 转码2 = 'ess', 符号 = '://';
 
 let ENV_CACHE = null;
-const decoder = new TextDecoder(); // ✅ 优化：TextDecoder 实例只创建一次
+const textDecoder = new TextDecoder();  // ✅ 优化⑤：TextDecoder 全局复用
 
 function 读取环境变量(name, fallback, env) {
   const raw = import.meta?.env?.[name] ?? env?.[name];
@@ -83,7 +83,7 @@ export default {
         const { tcpSocket, initialData } = await 解析VL标头(data, cfg);
         const [client, server] = new WebSocketPair();
         server.accept();
-        传输数据管道(server, tcpSocket, initialData);
+        await 传输数据管道(server, tcpSocket, initialData);  // ✅ 优化⑦ 使用 pipeTo
         return new Response(null, { status: 101, webSocket: client });
       } catch (e) {
         return new Response(`连接目标失败: ${e.message}`, { status: 502 });
@@ -108,7 +108,7 @@ async function 解析VL标头(buf, cfg) {
     offset += 4;
   } else if (c[offset - 1] === 2) {
     const len = c[offset];
-    host = decoder.decode(c.slice(offset + 1, offset + 1 + len));  // ✅ 优化后调用
+    host = textDecoder.decode(c.slice(offset + 1, offset + 1 + len)); // ✅ 优化⑤ 复用 textDecoder
     offset += len + 1;
   } else {
     host = Array(8).fill().map((_, i) => b.getUint16(offset + 2 * i).toString(16)).join(':');
@@ -120,7 +120,7 @@ async function 解析VL标头(buf, cfg) {
     const sock = await connect({ hostname: host, port });
     await sock.opened;
     return { tcpSocket: sock, initialData };
-  } catch (e) {}
+  } catch {}
 
   if (cfg.NAT64) {
     try {
@@ -135,7 +135,7 @@ async function 解析VL标头(buf, cfg) {
       const sock = await connect({ hostname: natTarget.replace(/^\[|\]$/g, ''), port });
       await sock.opened;
       return { tcpSocket: sock, initialData };
-    } catch (e) {}
+    } catch {}
   }
 
   if (cfg.启用反代功能 && cfg.PROXYIP) {
@@ -151,23 +151,33 @@ async function 解析VL标头(buf, cfg) {
 
 async function 传输数据管道(ws, tcp, init) {
   const writer = tcp.writable.getWriter();
-  const reader = tcp.readable.getReader();
 
   ws.send(new Uint8Array([0, 0]));
   if (init) await writer.write(init);
 
-  ws.addEventListener('message', evt => writer.write(evt.data));
-  try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      if (value) ws.send(value);
+  // ✅ 优化⑦ 使用 pipeTo 替代 while+read
+  tcp.readable.pipeTo(new WritableStream({
+    write(chunk) {
+      ws.send(chunk);
+    },
+    close() {
+      try { ws.close(); } catch {}
+    },
+    abort() {
+      try { ws.close(); } catch {}
     }
-  } catch {}
-  try { ws.close(); } catch {}
-  try { reader.cancel(); } catch {}
-  try { writer.releaseLock(); } catch {}
-  tcp.close();
+  })).catch(() => {
+    try { ws.close(); } catch {}
+  });
+
+  ws.addEventListener('message', evt => {
+    writer.write(evt.data).catch(() => {});
+  });
+
+  ws.addEventListener('close', () => {
+    writer.releaseLock();
+    tcp.close();
+  });
 }
 
 function 验证VL的密钥(a) {
