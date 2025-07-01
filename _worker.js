@@ -36,7 +36,6 @@ function 初始化配置(env) {
   return ENV_CACHE;
 }
 
-/* ---------- NAT64 工具 ---------- */
 function convertToNAT64IPv6(ipv4) {
   const parts = ipv4.split('.');
   if (parts.length !== 4) throw new Error('无效的IPv4地址');
@@ -57,27 +56,10 @@ async function getIPv6ProxyAddress(domain) {
 export default {
   async fetch(访问请求, env) {
     const cfg = 初始化配置(env);
-
     const 升级标头 = 访问请求.headers.get('Upgrade');
     const url = new URL(访问请求.url);
 
     if (!升级标头 || 升级标头 !== 'websocket') {
-      if (cfg.TXT && cfg.TXT.length) {
-        const 链接数组 = Array.isArray(cfg.TXT) ? cfg.TXT : [cfg.TXT];
-        const 所有节点 = [];
-        for (const 链接 of 链接数组) {
-          try {
-            const 响应 = await fetch(链接);
-            const 文本 = await 响应.text();
-            const 节点 = 文本.split('\n').map(line => line.trim()).filter(line => line);
-            所有节点.push(...节点);
-          } catch (e) {
-            console.warn(`无法获取或解析链接: ${链接}`, e);
-          }
-        }
-        if (所有节点.length > 0) cfg.IP = 所有节点;
-      }
-
       switch (url.pathname) {
         case `/${cfg.ID}`:
           return new Response(给我订阅页面(cfg.ID, 访问请求.headers.get('Host')), {
@@ -96,18 +78,18 @@ export default {
       if (验证VL的密钥(new Uint8Array(data.slice(1, 17))) !== cfg.UUID) {
         return new Response('无效的UUID', { status: 403 });
       }
-      const { tcpSocket, initialData } = await 解析VL标头(data, cfg);
-      return await 升级WS请求(访问请求, tcpSocket, initialData);
+      try {
+        const { tcpSocket, initialData } = await 解析VL标头(data, cfg);
+        const [client, server] = new WebSocketPair();
+        server.accept();
+        传输数据管道(server, tcpSocket, initialData);
+        return new Response(null, { status: 101, webSocket: client });
+      } catch (e) {
+        return new Response(`连接目标失败: ${e.message}`, { status: 502 });
+      }
     }
   }
 };
-
-async function 升级WS请求(访问请求, tcpSocket, initialData) {
-  const { 0: 客户端, 1: WS接口 } = new WebSocketPair();
-  WS接口.accept();
-  建立传输管道(WS接口, tcpSocket, initialData);
-  return new Response(null, { status: 101, webSocket: 客户端 });
-}
 
 function 使用64位加解密(str) {
   str = str.replace(/-/g, '+').replace(/_/g, '/');
@@ -128,18 +110,21 @@ async function 解析VL标头(buf, cfg) {
     host = new TextDecoder().decode(c.slice(offset + 1, offset + 1 + len));
     offset += len + 1;
   } else {
-    const dv = new DataView(buf);
-    host = Array(8).fill().map((_, i) => dv.getUint16(offset + 2 * i).toString(16)).join(':');
+    host = Array(8).fill().map((_, i) => b.getUint16(offset + 2 * i).toString(16)).join(':');
     offset += 16;
   }
   const initialData = buf.slice(offset);
 
+  // IPv6 直连尝试
   try {
-    const tcpSocket = await connect({ hostname: host, port });
-    await tcpSocket.opened;
-    return { tcpSocket, initialData };
-  } catch { /* ignore */ }
+    const sock = await connect({ hostname: host, port });
+    await sock.opened;
+    return { tcpSocket: sock, initialData };
+  } catch (e) {
+    // fallback
+  }
 
+  // NAT64 尝试
   if (cfg.NAT64) {
     try {
       let natTarget;
@@ -150,37 +135,45 @@ async function 解析VL标头(buf, cfg) {
       } else {
         natTarget = await getIPv6ProxyAddress(host);
       }
-      const natSock = await connect({ hostname: natTarget.replace(/^\[|\]$/g, ''), port });
-      await natSock.opened;
-      return { tcpSocket: natSock, initialData };
-    } catch { /* ignore */ }
+      const sock = await connect({ hostname: natTarget.replace(/^\[|\]$/g, ''), port });
+      await sock.opened;
+      return { tcpSocket: sock, initialData };
+    } catch (e) {
+      // fallback
+    }
   }
 
-  if (!cfg.启用反代功能 || !cfg.PROXYIP) throw Error('连接失败');
-  const [h, p] = cfg.PROXYIP.split(':');
-  const tcpSocket = await connect({ hostname: h, port: Number(p) || port });
-  await tcpSocket.opened;
-  return { tcpSocket, initialData };
+  // 反代尝试
+  if (cfg.启用反代功能 && cfg.PROXYIP) {
+    const [代理主机, 代理端口] = cfg.PROXYIP.split(':');
+    const portNum = Number(代理端口) || port;
+    const sock = await connect({ hostname: 代理主机, port: portNum });
+    await sock.opened;
+    return { tcpSocket: sock, initialData };
+  }
+
+  throw new Error('连接失败，目标不可达');
 }
 
-async function 建立传输管道(ws, tcp, init) {
-  ws.send(new Uint8Array([0, 0]));
+async function 传输数据管道(ws, tcp, init) {
   const writer = tcp.writable.getWriter();
   const reader = tcp.readable.getReader();
+
+  ws.send(new Uint8Array([0, 0]));
   if (init) await writer.write(init);
-  ws.addEventListener('message', e => writer.write(e.data));
+
+  ws.addEventListener('message', evt => writer.write(evt.data));
   try {
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
       if (value) ws.send(value);
     }
-  } finally {
-    try { ws.close(); } catch {}
-    try { reader.cancel(); } catch {}
-    try { writer.releaseLock(); } catch {}
-    tcp.close();
-  }
+  } catch {}
+  try { ws.close(); } catch {}
+  try { reader.cancel(); } catch {}
+  try { writer.releaseLock(); } catch {}
+  tcp.close();
 }
 
 function 验证VL的密钥(a) {
