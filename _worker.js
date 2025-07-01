@@ -1,39 +1,10 @@
-// ====================================================================
-// Cloudflare Worker: VL over WebSocket + NAT64 + 兜底
-// --------------------------------------------------------------------
-// 环境变量 (Vars) 说明：
-//   UUID         必填，VL 用户的 UUID                         例：173eb8bd-7154-4e20-91ec-dfadaf1f632b
-//   ID           可选，订阅路径 (默认 242222)                   例：myvless
-//   PROXYIP      可选，反代兜底地址 "ip:port" 或 "host:port"  例：203.0.113.9:443
-//   NAT64        可选，是否启用 NAT64 (true|false，默认 true)   例：false
-//   启用反代功能  可选，true|false (默认 true)，是否启用反代兜底
-// ====================================================================
-// 如使用 wrangler 部署，可在 wrangler.toml 中：
-// [vars]
-// UUID = "173eb8bd-7154-4e20-91ec-dfadaf1f632b"
-// NAT64 = "false"
-// PROXYIP = "proxyip.zone.id"
-// --------------------------------------------------------------------
-
 import { connect } from 'cloudflare:sockets';
 
 let 转码 = 'vl', 转码2 = 'ess', 符号 = '://';
 
-//////////////////////////////////////////////////////////////////////////配置区块////////////////////////////////////////////////////////////////////////
-let 哎呀呀这是我的ID啊 = "242222";          // 订阅路径
-let 哎呀呀这是我的VL密钥 = "d26432c5-a84b-47c3-aaf8-b949f326efb3"; // UUID
+let ENV_CACHE = null;
 
-let 我的优选 = ['104.16.160.145'];
-let 我的优选TXT = [];
-
-let 启用反代功能 = true;
-let 反代IP = 'sjc.o00o.ooo:443';
-
-let NAT64 = false;       // 默认开启 NAT64
-
-let 我的节点名字 = '狂暴';
-
-const 读取环境变量 = (name, fallback, env) => {
+function 读取环境变量(name, fallback, env) {
   const raw = import.meta?.env?.[name] ?? env?.[name];
   if (raw === undefined || raw === null || raw === '') return fallback;
   if (typeof raw === 'string') {
@@ -47,14 +18,30 @@ const 读取环境变量 = (name, fallback, env) => {
     return trimmed;
   }
   return raw;
-};
+}
+
+function 初始化配置(env) {
+  if (ENV_CACHE) return ENV_CACHE;
+
+  ENV_CACHE = {
+    ID: 读取环境变量('ID', '242222', env),
+    UUID: 读取环境变量('UUID', 'd26432c5-a84b-47c3-aaf8-b949f326efb3', env),
+    IP: 读取环境变量('IP', ['104.16.160.145'], env),
+    TXT: 读取环境变量('TXT', [], env),
+    PROXYIP: 读取环境变量('PROXYIP', 'sjc.o00o.ooo:443', env),
+    启用反代功能: 读取环境变量('启用反代功能', true, env),
+    NAT64: 读取环境变量('NAT64', false, env),
+    我的节点名字: 读取环境变量('我的节点名字', '狂暴', env),
+  };
+  return ENV_CACHE;
+}
 
 /* ---------- NAT64 工具 ---------- */
 function convertToNAT64IPv6(ipv4) {
   const parts = ipv4.split('.');
   if (parts.length !== 4) throw new Error('无效的IPv4地址');
   const hex = parts.map(p => Number(p).toString(16).padStart(2, '0'));
-  return `[2001:67c:2960:6464::${hex[0]}${hex[1]}:${hex[2]}${hex[3]}]`;
+  return `2001:67c:2960:6464::${hex[0]}${hex[1]}:${hex[2]}${hex[3]}`;
 }
 
 async function getIPv6ProxyAddress(domain) {
@@ -69,22 +56,14 @@ async function getIPv6ProxyAddress(domain) {
 
 export default {
   async fetch(访问请求, env) {
-    哎呀呀这是我的ID啊   = 读取环境变量('ID',           哎呀呀这是我的ID啊, env);
-    哎呀呀这是我的VL密钥 = 读取环境变量('UUID',         哎呀呀这是我的VL密钥, env);
-    我的优选           = 读取环境变量('IP',           我的优选,           env);
-    我的优选TXT        = 读取环境变量('TXT',          我的优选TXT,        env);
-    反代IP             = 读取环境变量('PROXYIP',      反代IP,             env);
-    启用反代功能       = 读取环境变量('启用反代功能', 启用反代功能,     env);
-    NAT64            = 读取环境变量('NAT64',        NAT64,              env);
-    我的节点名字       = 读取环境变量('我的节点名字',   我的节点名字,       env);
+    const cfg = 初始化配置(env);
 
     const 升级标头 = 访问请求.headers.get('Upgrade');
     const url = new URL(访问请求.url);
 
     if (!升级标头 || 升级标头 !== 'websocket') {
-      /* ---- 订阅/普通响应代码 ---- */
-      if (我的优选TXT) {
-        const 链接数组 = Array.isArray(我的优选TXT) ? 我的优选TXT : [我的优选TXT];
+      if (cfg.TXT && cfg.TXT.length) {
+        const 链接数组 = Array.isArray(cfg.TXT) ? cfg.TXT : [cfg.TXT];
         const 所有节点 = [];
         for (const 链接 of 链接数组) {
           try {
@@ -96,15 +75,16 @@ export default {
             console.warn(`无法获取或解析链接: ${链接}`, e);
           }
         }
-        if (所有节点.length > 0) 我的优选 = 所有节点;
+        if (所有节点.length > 0) cfg.IP = 所有节点;
       }
+
       switch (url.pathname) {
-        case `/${哎呀呀这是我的ID啊}`:
-          return new Response(给我订阅页面(哎呀呀这是我的ID啊, 访问请求.headers.get('Host')), {
+        case `/${cfg.ID}`:
+          return new Response(给我订阅页面(cfg.ID, 访问请求.headers.get('Host')), {
             status: 200, headers: { "Content-Type": "text/plain;charset=utf-8" }
           });
-        case `/${哎呀呀这是我的ID啊}/${转码}${转码2}`:
-          return new Response(给我通用配置文件(访问请求.headers.get('Host')), {
+        case `/${cfg.ID}/${转码}${转码2}`:
+          return new Response(给我通用配置文件(访问请求.headers.get('Host'), cfg), {
             status: 200, headers: { "Content-Type": "text/plain;charset=utf-8" }
           });
         default:
@@ -113,10 +93,10 @@ export default {
     } else {
       const enc = 访问请求.headers.get('sec-websocket-protocol');
       const data = 使用64位加解密(enc);
-      if (验证VL的密钥(new Uint8Array(data.slice(1, 17))) !== 哎呀呀这是我的VL密钥) {
+      if (验证VL的密钥(new Uint8Array(data.slice(1, 17))) !== cfg.UUID) {
         return new Response('无效的UUID', { status: 403 });
       }
-      const { tcpSocket, initialData } = await 解析VL标头(data);
+      const { tcpSocket, initialData } = await 解析VL标头(data, cfg);
       return await 升级WS请求(访问请求, tcpSocket, initialData);
     }
   }
@@ -134,7 +114,7 @@ function 使用64位加解密(str) {
   return Uint8Array.from(atob(str), c => c.charCodeAt(0)).buffer;
 }
 
-async function 解析VL标头(buf) {
+async function 解析VL标头(buf, cfg) {
   const b = new DataView(buf), c = new Uint8Array(buf);
   const addrTypeIndex = c[17];
   const port = b.getUint16(18 + addrTypeIndex + 1);
@@ -154,15 +134,13 @@ async function 解析VL标头(buf) {
   }
   const initialData = buf.slice(offset);
 
-  /* --------- 1. 直连 --------- */
   try {
     const tcpSocket = await connect({ hostname: host, port });
     await tcpSocket.opened;
     return { tcpSocket, initialData };
   } catch { /* ignore */ }
 
-  /* --------- 2. NAT64 --------- */
-  if (NAT64) {
+  if (cfg.NAT64) {
     try {
       let natTarget;
       if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
@@ -178,9 +156,8 @@ async function 解析VL标头(buf) {
     } catch { /* ignore */ }
   }
 
-  /* --------- 3. 反代兜底 --------- */
-  if (!启用反代功能 || !反代IP) throw Error('连接失败');
-  const [h, p] = 反代IP.split(':');
+  if (!cfg.启用反代功能 || !cfg.PROXYIP) throw Error('连接失败');
+  const [h, p] = cfg.PROXYIP.split(':');
   const tcpSocket = await connect({ hostname: h, port: Number(p) || port });
   await tcpSocket.opened;
   return { tcpSocket, initialData };
@@ -212,21 +189,18 @@ function 验证VL的密钥(a) {
 }
 
 function 给我订阅页面(ID, host) {
-  return `
-订阅地址: https${符号}${host}/${ID}/${转码}${转码2}
-`;
+  return `订阅地址: https${符号}${host}/${ID}/${转码}${转码2}`;
 }
 
-function 给我通用配置文件(host) {
-  我的优选.push(`${host}:443`);
-
-  return 我的优选.map(item => {
+function 给我通用配置文件(host, cfg) {
+  const ips = cfg.IP.concat([`${host}:443`]);
+  return ips.map(item => {
     const [main, tls] = item.split("@");
-    const [addrPort, name = 我的节点名字] = main.split("#");
+    const [addrPort, name = cfg.我的节点名字] = main.split("#");
     const parts = addrPort.split(":");
     const port = parts.length > 1 ? Number(parts.pop()) : 443;
     const addr = parts.join(":");
     const tlsOpt = tls === 'notls' ? 'security=none' : 'security=tls';
-    return `${转码}${转码2}${符号}${哎呀呀这是我的VL密钥}@${addr}:${port}?encryption=none&${tlsOpt}&sni=${host}&type=ws&host=${host}&path=%2F%3Fed%3D2560#${name}`;
+    return `${转码}${转码2}${符号}${cfg.UUID}@${addr}:${port}?encryption=none&${tlsOpt}&sni=${host}&type=ws&host=${host}&path=%2F%3Fed%3D2560#${name}`;
   }).join("\n");
 }
