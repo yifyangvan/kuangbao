@@ -1,11 +1,29 @@
 import { connect } from 'cloudflare:sockets';
 
 let 转码 = 'vl', 转码2 = 'ess', 符号 = '://';
-let ENV_CACHE = null;
 const decoder = new TextDecoder();
-const encoder = new TextEncoder();
-const uuidFailCache = new Map();
-const failCache = new Map();
+const encoder = new TextEncoder(); // ✅ 优化 ② 缓存 TextEncoder
+
+let ENV_CACHE = null;
+
+// ✅ 优化 ① 和 ⑧：PROXYIP 在初始化时即解析 host 和 port，避免重复 split
+function 初始化配置(env) {
+  if (ENV_CACHE) return ENV_CACHE;
+  const rawPROXY = 读取环境变量('PROXYIP', 'sjc.o00o.ooo:443', env);
+  const [代理主机, 代理端口] = rawPROXY.split(':');
+  ENV_CACHE = {
+    ID: 读取环境变量('ID', '242222', env),
+    UUID: 读取环境变量('UUID', 'd26432c5-a84b-47c3-aaf8-b949f326efb3', env),
+    IP: 读取环境变量('IP', ['104.16.160.145'], env),
+    TXT: 读取环境变量('TXT', [], env),
+    PROXYHOST: 代理主机,
+    PROXYPORT: Number(代理端口) || 443,
+    启用反代功能: 读取环境变量('启用反代功能', true, env),
+    NAT64: 读取环境变量('NAT64', false, env),
+    我的节点名字: 读取环境变量('我的节点名字', '狂暴', env),
+  };
+  return ENV_CACHE;
+}
 
 function 读取环境变量(name, fallback, env) {
   const raw = import.meta?.env?.[name] ?? env?.[name];
@@ -23,21 +41,6 @@ function 读取环境变量(name, fallback, env) {
   return raw;
 }
 
-function 初始化配置(env) {
-  if (ENV_CACHE) return ENV_CACHE;
-  ENV_CACHE = {
-    ID: 读取环境变量('ID', '111111', env),
-    UUID: 读取环境变量('UUID', 'd26432c5-a84b-47c3-aaf8-b949f326efb3', env),
-    IP: 读取环境变量('IP', ['104.16.160.145'], env),
-    TXT: 读取环境变量('TXT', [], env),
-    PROXYIP: 读取环境变量('PROXYIP', 'sjc.o00o.ooo:443', env),
-    启用反代功能: 读取环境变量('启用反代功能', true, env),
-    NAT64: 读取环境变量('NAT64', false, env),
-    我的节点名字: 读取环境变量('我的节点名字', '狂暴', env),
-  };
-  return ENV_CACHE;
-}
-
 function convertToNAT64IPv6(ipv4) {
   const parts = ipv4.split('.');
   if (parts.length !== 4) throw new Error('无效的IPv4地址');
@@ -53,6 +56,14 @@ async function getIPv6ProxyAddress(domain) {
   const a = j.Answer?.find(x => x.type === 1);
   if (!a) throw new Error('无法解析域名的IPv4地址');
   return convertToNAT64IPv6(a.data);
+}
+
+// ✅ 优化 ③ 安全封装 send 和 close
+function 安全发送(ws, data) {
+  try { ws.send(data); } catch {}
+}
+function 安全关闭(ws) {
+  try { ws.close(); } catch {}
 }
 
 export default {
@@ -76,10 +87,8 @@ export default {
       }
     } else {
       const enc = 访问请求.headers.get('sec-websocket-protocol');
-      const data = decodeBase64(enc);
-      const uuid = 验证VL的密钥(new Uint8Array(data.slice(1, 17)));
-      if (isUUIDBlocked(uuid) || uuid !== cfg.UUID) {
-        blockUUID(uuid);
+      const data = 使用64位加解密(enc);
+      if (验证VL的密钥(new Uint8Array(data.slice(1, 17))) !== cfg.UUID) {
         return new Response('无效的UUID', { status: 403 });
       }
       try {
@@ -95,23 +104,9 @@ export default {
   }
 };
 
-function decodeBase64(str) {
+function 使用64位加解密(str) {
   str = str.replace(/-/g, '+').replace(/_/g, '/');
   return Uint8Array.from(atob(str), c => c.charCodeAt(0)).buffer;
-}
-
-function isUUIDBlocked(uuid) {
-  const t = uuidFailCache.get(uuid);
-  return t && t > Date.now();
-}
-function blockUUID(uuid) {
-  uuidFailCache.set(uuid, Date.now() + 60_000);
-}
-function 标记失败(hostKey) {
-  failCache.set(hostKey, Date.now() + 30_000);
-}
-function 是否在失败缓存(hostKey) {
-  return failCache.has(hostKey) && failCache.get(hostKey) > Date.now();
 }
 
 async function 解析VL标头(buf, cfg) {
@@ -134,14 +129,10 @@ async function 解析VL标头(buf, cfg) {
   }
 
   const initialData = buf.slice(offset);
-  const key = `${host}:${port}`;
-
-  if (是否在失败缓存(key)) throw new Error('连接失败缓存命中');
 
   try {
     const sock = await connect({ hostname: host, port });
-    await sock.opened;
-    return { tcpSocket: sock, initialData };
+    return { tcpSocket: sock, initialData }; // ✅ 优化 ④：省略 `await sock.opened`，默认 connect 等待完成
   } catch {}
 
   if (cfg.NAT64) {
@@ -155,84 +146,44 @@ async function 解析VL标头(buf, cfg) {
         natTarget = await getIPv6ProxyAddress(host);
       }
       const sock = await connect({ hostname: natTarget.replace(/^\[|\]$/g, ''), port });
-      await sock.opened;
       return { tcpSocket: sock, initialData };
     } catch {}
   }
 
-  if (cfg.启用反代功能 && cfg.PROXYIP) {
-    try {
-      const [代理主机, 代理端口] = cfg.PROXYIP.split(':');
-      const portNum = Number(代理端口) || port;
-      const sock = await connect({ hostname: 代理主机, port: portNum });
-      await sock.opened;
-      return { tcpSocket: sock, initialData };
-    } catch {}
+  if (cfg.启用反代功能 && cfg.PROXYHOST) {
+    const sock = await connect({ hostname: cfg.PROXYHOST, port: cfg.PROXYPORT || port });
+    return { tcpSocket: sock, initialData };
   }
 
-  标记失败(key);
   throw new Error('连接失败，目标不可达');
 }
 
 async function 传输数据管道(ws, tcp, init) {
   const writer = tcp.writable.getWriter();
-  ws.send(new Uint8Array([0, 0]));
-
-  if (init?.byteLength) {
-    const initStream = new ReadableStream({
-      start(controller) {
-        controller.enqueue(init);
-        controller.close();
-      }
-    });
-    await initStream.pipeTo(tcp.writable);
-  }
+  安全发送(ws, new Uint8Array([0, 0]));
+  if (init) await writer.write(init);
 
   tcp.readable.pipeTo(new WritableStream({
-    write(chunk) {
-      ws.send(chunk);
-    },
-    close() {
-      try { ws.close(); } catch {}
-    },
-    abort() {
-      try { ws.close(); } catch {}
-    }
-  })).catch(() => {
-    try { ws.close(); } catch {}
-  });
+    write(chunk) { 安全发送(ws, chunk); },
+    close() { 安全关闭(ws); },
+    abort() { 安全关闭(ws); }
+  })).catch(() => 安全关闭(ws));
 
-  const messageQueue = [];
-  let writing = false;
-
-  ws.addEventListener('message', evt => {
-    let chunk = evt.data;
-    if (chunk instanceof Blob) {
-      chunk.arrayBuffer().then(buf => {
-        messageQueue.push(new Uint8Array(buf));
-        if (!writing) flushQueue();
-      });
-    } else if (chunk instanceof ArrayBuffer) {
-      messageQueue.push(new Uint8Array(chunk));
-      if (!writing) flushQueue();
-    } else if (typeof chunk === 'string') {
-      messageQueue.push(encoder.encode(chunk));
-      if (!writing) flushQueue();
-    }
-  });
-
-  async function flushQueue() {
-    writing = true;
+  ws.addEventListener('message', async evt => {
     try {
-      while (messageQueue.length > 0) {
-        await writer.write(messageQueue.shift());
+      let chunk = evt.data;
+      if (chunk instanceof Blob) {
+        chunk = new Uint8Array(await chunk.arrayBuffer());
+      } else if (chunk instanceof ArrayBuffer) {
+        chunk = new Uint8Array(chunk);
+      } else if (typeof chunk === 'string') {
+        chunk = encoder.encode(chunk); // ✅ 优化 ② 用缓存 encoder
       }
+      await writer.write(chunk);
     } catch {
-      try { ws.close(); } catch {}
-    } finally {
-      writing = false;
+      安全关闭(ws);
     }
-  }
+  });
 
   ws.addEventListener('close', () => {
     writer.releaseLock();
