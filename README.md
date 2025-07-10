@@ -47,7 +47,7 @@
 
 ```
 UUID = d26432c5-a84b-47c3-aaf8-b949f326efb3
-ID = 242222
+ID = 123456
 IP = 104.16.160.145
 我的节点名字 = 狂暴转发
 启用反代功能 = true
@@ -81,7 +81,7 @@ NAT64 = true
 例如：
 
 ```text
-https://your-worker-subdomain.workers.dev/242222/vless
+https://your-worker-subdomain.workers.dev/123456/vless
 ```
 
 ---
@@ -91,8 +91,8 @@ https://your-worker-subdomain.workers.dev/242222/vless
 你可使用浏览器访问 `/ID` 和 `/ID/vless` 路径测试是否部署成功：
 
 ```
-https://your-worker-subdomain.workers.dev/242222
-https://your-worker-subdomain.workers.dev/242222/vless
+https://your-worker-subdomain.workers.dev/123456
+https://your-worker-subdomain.workers.dev/123456/vless
 ```
 
 如看到节点链接即表示部署成功。
