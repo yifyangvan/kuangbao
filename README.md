@@ -1,5 +1,3 @@
-当然，以下是优化排版、结构清晰、美观简洁的 `DEPLOYMENT.md` 部署说明内容，适合发布到 GitHub 或分享他人阅读：
-
 ---
 
 # 🚀 Cloudflare Workers TCP 中继部署指南
