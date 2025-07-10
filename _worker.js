@@ -26,7 +26,7 @@ function 读取环境变量(name, fallback, env) {
 function 初始化配置(env) {
   if (ENV_CACHE) return ENV_CACHE;
   ENV_CACHE = {
-    ID: 读取环境变量('ID', '242222', env),
+    ID: 读取环境变量('ID', '111111', env),
     UUID: 读取环境变量('UUID', 'd26432c5-a84b-47c3-aaf8-b949f326efb3', env),
     IP: 读取环境变量('IP', ['104.16.160.145'], env),
     TXT: 读取环境变量('TXT', [], env),
