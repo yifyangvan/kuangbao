@@ -37,7 +37,7 @@ https://你的域名/${ID}
 示例：
 
 ```
-https://example.pages.dev/242222
+https://example.pages.dev/111111
 ```
 
 
