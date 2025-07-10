@@ -1,3 +1,16 @@
+🌐 访问接口说明
+订阅地址：
+https://你的域名/${ID}
+示例：https://example.pages.dev/242222
+
+通用配置下载：
+https://你的域名/${ID}/vless
+示例：https://example.pages.dev/242222/vless
+
+WebSocket 链接入口：
+与客户端 WebSocket 请求路径一致，包含密钥加密信息。
+
+
 # 变更日志（Changelog）
 
 ## v1.5.0 - 2025-07-10
