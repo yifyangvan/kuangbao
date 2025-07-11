@@ -1,9 +1,3 @@
-/**
- * VL代理转发 Cloudflare Worker（压缩版）
- * - 代码简化变量名，删除冗余注释
- * - 保留核心逻辑，尽量减小体积以优化冷启动
- */
-
 import { connect } from 'cloudflare:sockets';
 
 const dec = new TextDecoder(),
