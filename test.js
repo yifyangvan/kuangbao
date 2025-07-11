@@ -1,217 +1,248 @@
+/**
+ * VL代理转发 Cloudflare Worker（压缩版）
+ * - 代码简化变量名，删除冗余注释
+ * - 保留核心逻辑，尽量减小体积以优化冷启动
+ */
+
 import { connect } from 'cloudflare:sockets';
 
-let 转码 = 'vl', 转码2 = 'ess', 符号 = '://';
-let ENV_CACHE = null;
-const decoder = new TextDecoder();
-const encoder = new TextEncoder();
+const dec = new TextDecoder(),
+  enc = new TextEncoder();
 
-const 连接失败缓存 = new Map();
+let ENV = null,
+  failCache = new Map(),
+  failCacheMax = 500,
+  failCacheTTL = 3e5, // 5分钟
 
-function 读取环境变量(name, fallback, env) {
-  const raw = import.meta?.env?.[name] ?? env?.[name];
-  if (raw == null || raw === '') return fallback;
-  if (typeof raw === 'string') {
-    const trimmed = raw.trim();
-    if (trimmed === 'true') return true;
-    if (trimmed === 'false') return false;
-    if (trimmed.includes('\n')) return trimmed.split('\n').map(item => item.trim()).filter(Boolean);
-    if (!isNaN(trimmed)) return Number(trimmed);
-    return trimmed;
+uuid2arr = (u) => {
+  const h = u.replace(/-/g, '');
+  let r = new Uint8Array(16);
+  for (let i = 0; i < 16; i++) r[i] = parseInt(h.slice(2 * i, 2 * i + 2), 16);
+  return r;
+},
+eqArr = (a, b) => {
+  if (a.length !== b.length) return 0;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return 0;
+  return 1;
+},
+atobUrlSafe = (s) => {
+  s = s.replace(/-/g, '+').replace(/_/g, '/');
+  while (s.length % 4) s += '=';
+  let b = atob(s),
+    u = new Uint8Array(b.length);
+  for (let i = 0; i < b.length; i++) u[i] = b.charCodeAt(i);
+  return u;
+},
+readEnv = (k, def, env) => {
+  let v = import.meta.env?.[k] ?? env?.[k];
+  if (v == null || v === '') return def;
+  if (typeof v === 'string') {
+    let t = v.trim();
+    if (t === 'true') return !0;
+    if (t === 'false') return !1;
+    if (t.includes('\n'))
+      return t
+        .split('\n')
+        .map((x) => x.trim())
+        .filter(Boolean);
+    if (!isNaN(t)) return Number(t);
+    return t;
   }
-  return raw;
-}
-
-function 初始化配置(env) {
-  if (ENV_CACHE) return ENV_CACHE;
-  ENV_CACHE = {
-    ID: 读取环境变量('ID', '242222', env),
-    UUID: 读取环境变量('UUID', 'd26432c5-a84b-47c3-aaf8-b949f326efb3', env),
-    IP: 读取环境变量('IP', ['104.16.160.145'], env),
-    TXT: 读取环境变量('TXT', [], env),
-    PROXYIP: 读取环境变量('PROXYIP', 'sjc.o00o.ooo:443', env),
-    启用反代功能: 读取环境变量('启用反代功能', true, env),
-    NAT64: 读取环境变量('NAT64', false, env),
-    我的节点名字: 读取环境变量('我的节点名字', '狂暴', env),
+  return v;
+},
+initCfg = (env) => {
+  if (ENV) return ENV;
+  ENV = {
+    ID: readEnv('ID', '242222', env),
+    UUID: readEnv('UUID', 'd26432c5-a84b-47c3-aaf8-b949f326efb3', env),
+    IP: readEnv('IP', ['104.16.160.145'], env),
+    TXT: readEnv('TXT', [], env),
+    PROXYIP: readEnv('PROXYIP', 'sjc.o00o.ooo:443', env),
+    REVERSE: readEnv('启用反代功能', !0, env),
+    NAT64: readEnv('NAT64', !1, env),
+    NAME: readEnv('我的节点名字', '狂暴', env),
   };
-  return ENV_CACHE;
-}
+  ENV.uuidB = uuid2arr(ENV.UUID);
+  return ENV;
+},
+cleanFailCache = () => {
+  let now = Date.now();
+  for (let [k, v] of failCache) if (v.expire < now) failCache.delete(k);
+},
+convNAT64 = (ip) => {
+  let p = ip.split('.').map((x) => Number(x).toString(16).padStart(2, '0'));
+  return `2001:67c:2960:6464::${p[0]}${p[1]}:${p[2]}${p[3]}`;
+},
+getIPv6 = async (d) => {
+  let r = await fetch(`https://1.1.1.1/dns-query?name=${d}&type=A`, { headers: { Accept: 'application/dns-json' } });
+  let j = await r.json();
+  let a = j.Answer?.find((x) => x.type === 1);
+  if (!a) throw '解析失败';
+  return convNAT64(a.data);
+},
+mkCfgFile = (host, c) =>
+  c.IP.concat([host + ':443'])
+    .map((ip) => {
+      let [m, t] = ip.split('@'),
+        [addr, nm = c.NAME] = m.split('#'),
+        ps = addr.split(':'),
+        pt = Number(ps.length > 1 ? ps.pop() : 443),
+        ad = ps.join(':'),
+        tls = t === 'notls' ? 'security=none' : 'security=tls';
+      return `vless://${c.UUID}@${ad}:${pt}?encryption=none&${tls}&sni=${host}&type=ws&host=${host}&path=%2F%3Fed%3D2560#${nm}`;
+    })
+    .join('\n'),
+clearRes = (ws, w, t) => {
+  try { ws?.close(); } catch {}
+  try { w?.releaseLock(); } catch {}
+  try { t?.close(); } catch {}
+},
+mergeU8A = (arrs) => {
+  if (arrs.length === 1) return arrs[0];
+  let l = arrs.reduce((a, b) => a + b.length, 0),
+    r = new Uint8Array(l),
+    o = 0;
+  for (let a of arrs) {
+    r.set(a, o);
+    o += a.length;
+  }
+  return r;
+},
+pipeData = async (ws, tcp, init) => {
+  const w = tcp.writable.getWriter();
+  ws.send(new Uint8Array([0, 0]));
+  if (init) await w.write(new Uint8Array(init));
 
-function convertToNAT64IPv6(ipv4) {
-  const parts = ipv4.split('.');
-  const hex = parts.map(p => Number(p).toString(16).padStart(2, '0'));
-  return `2001:67c:2960:6464::${hex[0]}${hex[1]}:${hex[2]}${hex[3]}`;
-}
+  const abort = new AbortController();
+  const to = setTimeout(() => abort.abort(), 15e3);
 
-async function getIPv6ProxyAddress(domain) {
-  const r = await fetch(`https://1.1.1.1/dns-query?name=${domain}&type=A`, {
-    headers: { 'Accept': 'application/dns-json' }
+  tcp.readable.pipeTo(
+    new WritableStream({
+      write(c) { ws.send(c); },
+      close() { clearRes(ws, w, tcp); },
+      abort() { clearRes(ws, w, tcp); },
+    }),
+    { signal: abort.signal }
+  ).catch(() => clearRes(ws, w, tcp)).finally(() => clearTimeout(to));
+
+  let buf = [],
+    writing = 0;
+  function flush() {
+    if (writing) return;
+    writing = 1;
+    queueMicrotask(async () => {
+      let d = mergeU8A(buf);
+      buf = [];
+      try {
+        await w.write(d);
+      } catch { clearRes(ws, w, tcp); }
+      writing = 0;
+    });
+  }
+  ws.addEventListener('message', (e) => {
+    let d = e.data;
+    if (typeof d === 'string') d = enc.encode(d);
+    else if (d instanceof Blob) d = new Uint8Array(d.arrayBuffer());
+    else if (d instanceof ArrayBuffer) d = new Uint8Array(d);
+    buf.push(d);
+    flush();
   });
-  const j = await r.json();
-  const a = j.Answer?.find(x => x.type === 1);
-  if (!a) throw new Error('无法解析域名的IPv4地址');
-  return convertToNAT64IPv6(a.data);
-}
+  ws.addEventListener('close', () => clearRes(ws, w, tcp));
+},
+parseVLHead = async (buf, c) => {
+  let b = new Uint8Array(buf),
+    t = b[17],
+    port = (b[18 + t + 1] << 8) | b[18 + t + 2],
+    off = 18 + t + 4,
+    host;
 
-function 验证VL的密钥(u8) {
-  const hex = [...u8].map(v => v.toString(16).padStart(2, '0')).join('');
-  return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
-}
+  switch (b[off - 1]) {
+    case 1:
+      host = `${b[off]}.${b[off + 1]}.${b[off + 2]}.${b[off + 3]}`;
+      off += 4;
+      break;
+    case 2:
+      let l = b[off];
+      host = dec.decode(b.subarray(off + 1, off + 1 + l));
+      off += l + 1;
+      break;
+    default:
+      host = Array(8).fill(0).map((_, i) => ((b[off + 2 * i] << 8) | b[off + 2 * i + 1]).toString(16)).join(':');
+      off += 16;
+  }
 
-export default {
-  async fetch(访问请求, env) {
-    const cfg = 初始化配置(env);
-    const 升级标头 = 访问请求.headers.get('Upgrade');
-    const url = new URL(访问请求.url);
+  const initData = buf.byteLength > off ? buf.slice(off) : null;
+  const cacheKey = host + ':' + port;
+  cleanFailCache();
+  if (failCache.has(cacheKey)) throw '缓存连接失败';
 
-    if (升级标头 !== 'websocket') {
-      const host = 访问请求.headers.get('Host');
-      if (url.pathname === `/${cfg.ID}`) {
-        return new Response(`订阅地址: https${符号}${host}/${cfg.ID}/${转码}${转码2}`, {
-          status: 200,
-          headers: { "Content-Type": "text/plain;charset=utf-8" }
-        });
+  let conns = [
+    async () => {
+      let sock = await connect({ hostname: host, port });
+      await sock.opened;
+      return { sock, initData };
+    },
+  ];
+
+  if (c.NAT64 || c.REVERSE) {
+    conns.push(async () => {
+      if (host.includes('.') && !host.includes(':')) {
+        let n6 = convNAT64(host);
+        let sock = await connect({ hostname: n6.replace(/\[|\]/g, ''), port });
+        await sock.opened;
+        return { sock, initData };
       }
-      if (url.pathname === `/${cfg.ID}/${转码}${转码2}`) {
-        return new Response(给我通用配置文件(host, cfg), {
-          status: 200,
-          headers: { "Content-Type": "text/plain;charset=utf-8" }
-        });
-      }
-      return new Response('Hello World!', { status: 200 });
+      throw 'NAT64不适用';
+    });
+    if (c.PROXYIP) {
+      conns.push(async () => {
+        let [h, p] = c.PROXYIP.split(':');
+        let sock = await connect({ hostname: h, port: Number(p) || port });
+        await sock.opened;
+        return { sock, initData };
+      });
     }
+  }
 
-    const enc = 访问请求.headers.get('sec-websocket-protocol');
-    if (!enc || enc.length < 24) return new Response('协议无效', { status: 400 });
-
-    const data = Uint8Array.from(atob(enc.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
-    const uuid = 验证VL的密钥(data.subarray(1, 17));
-    if (uuid !== cfg.UUID) return new Response('无效的UUID', { status: 403 });
-
-    try {
-      const { tcpSocket, initialData } = await 解析VL标头(data.buffer, cfg);
-      const [client, server] = new WebSocketPair();
-      server.accept();
-      传输数据管道(server, tcpSocket, initialData);
-      return new Response(null, { status: 101, webSocket: client });
-    } catch (e) {
-      return new Response(`连接目标失败: ${e.message}`, { status: 502 });
-    }
+  try {
+    let { sock, initData: d } = await Promise.any(conns.map((f) => f()));
+    return { tcpSocket: sock, initialData: d };
+  } catch {
+    if (failCache.size >= failCacheMax) failCache.delete(failCache.keys().next().value);
+    failCache.set(cacheKey, { expire: Date.now() + failCacheTTL });
+    throw '连接失败';
   }
 };
 
-async function 解析VL标头(buf, cfg) {
-  const c = new Uint8Array(buf);
-  const addrTypeIndex = c[17];
-  const port = (c[18 + addrTypeIndex + 1] << 8) | c[18 + addrTypeIndex + 2];
-  let offset = 18 + addrTypeIndex + 4;
-  let host;
+export default {
+  async fetch(req, env) {
+    const c = initCfg(env);
+    const up = req.headers.get('Upgrade'),
+      url = new URL(req.url);
 
-  switch (c[offset - 1]) {
-    case 1:
-      host = `${c[offset]}.${c[offset+1]}.${c[offset+2]}.${c[offset+3]}`;
-      offset += 4;
-      break;
-    case 2: {
-      const len = c[offset];
-      host = decoder.decode(c.subarray(offset + 1, offset + 1 + len));
-      offset += len + 1;
-      break;
+    if (up !== 'websocket') {
+      const host = req.headers.get('Host');
+      if (url.pathname === `/${c.ID}`)
+        return new Response(`订阅地址: https://${host}/${c.ID}/vless`, { status: 200, headers: { 'content-type': 'text/plain' } });
+      if (url.pathname === `/${c.ID}/vless`)
+        return new Response(mkCfgFile(host, c), { status: 200, headers: { 'content-type': 'text/plain' } });
+      return new Response('Hello World!', { status: 200 });
     }
-    default:
-      host = Array(8).fill().map((_, i) => ((c[offset + 2*i] << 8) | c[offset + 2*i + 1]).toString(16)).join(':');
-      offset += 16;
-  }
 
-  const initialData = buf.slice(offset);
+    const proto = req.headers.get('sec-websocket-protocol');
+    if (!proto || proto.length < 24) return new Response('协议错误', { status: 400 });
+    let data;
+    try { data = atobUrlSafe(proto); } catch { return new Response('协议解码失败', { status: 400 }); }
+    if (!eqArr(data.subarray(1, 17), c.uuidB)) return new Response('UUID不匹配', { status: 403 });
 
-  const cacheKey = host + ':' + port;
-  if (连接失败缓存.has(cacheKey)) throw new Error('连接路径已缓存失败');
-
-  try {
-    const sock = await connect({ hostname: host, port });
-    await sock.opened;
-    return { tcpSocket: sock, initialData };
-  } catch {}
-
-  if (cfg.NAT64 || cfg.启用反代功能) {
     try {
-      let natTarget;
-      if (host.indexOf('.') > -1 && !host.includes(':')) {
-        natTarget = convertToNAT64IPv6(host);
-      } else if (!host.includes(':')) {
-        natTarget = await getIPv6ProxyAddress(host);
-      }
-      if (natTarget) {
-        const sock = await connect({ hostname: natTarget.replace(/\[|\]/g, ''), port });
-        await sock.opened;
-        return { tcpSocket: sock, initialData };
-      }
-    } catch {}
-
-    if (cfg.PROXYIP) {
-      const [代理主机, 代理端口] = cfg.PROXYIP.split(':');
-      const portNum = Number(代理端口) || port;
-      try {
-        const sock = await connect({ hostname: 代理主机, port: portNum });
-        await sock.opened;
-        return { tcpSocket: sock, initialData };
-      } catch {}
+      const { tcpSocket, initialData } = await parseVLHead(data.buffer, c);
+      const [client, server] = new WebSocketPair();
+      server.accept();
+      pipeData(server, tcpSocket, initialData);
+      return new Response(null, { status: 101, webSocket: client });
+    } catch (e) {
+      return new Response(e.toString(), { status: 500 });
     }
-  }
-
-  连接失败缓存.set(cacheKey, true);
-  throw new Error('连接失败，目标不可达');
-}
-
-function 清理资源(ws, writer, tcp) {
-  try { ws?.close(); } catch {}
-  try { writer?.releaseLock(); } catch {}
-  try { tcp?.close(); } catch {}
-}
-
-async function 传输数据管道(ws, tcp, init) {
-  const writer = tcp.writable.getWriter();
-  ws.send(new Uint8Array([0, 0]));
-  if (init) await writer.write(init);
-
-  const abortController = new AbortController();
-  const timeout = setTimeout(() => abortController.abort(), 15000);
-
-  tcp.readable.pipeTo(new WritableStream({
-    write(chunk) {
-      ws.send(chunk);
-    },
-    close() { 清理资源(ws, writer, tcp); },
-    abort() { 清理资源(ws, writer, tcp); }
-  }), { signal: abortController.signal }).catch(() => 清理资源(ws, writer, tcp)).finally(() => clearTimeout(timeout));
-
-  let writeQueue = Promise.resolve();
-  ws.addEventListener('message', evt => {
-    writeQueue = writeQueue.then(async () => {
-      try {
-        let chunk = evt.data;
-        if (typeof chunk === 'string') chunk = encoder.encode(chunk);
-        else if (chunk instanceof Blob) chunk = new Uint8Array(await chunk.arrayBuffer());
-        else if (chunk instanceof ArrayBuffer) chunk = new Uint8Array(chunk);
-        await writer.write(chunk);
-      } catch { 清理资源(ws, writer, tcp); }
-    });
-  });
-
-  ws.addEventListener('close', () => {
-    清理资源(ws, writer, tcp);
-  });
-}
-
-function 给我通用配置文件(host, cfg) {
-  const ips = cfg.IP.concat([`${host}:443`]);
-  return ips.map(item => {
-    const [main, tls] = item.split("@");
-    const [addrPort, name = cfg.我的节点名字] = main.split("#");
-    const parts = addrPort.split(":");
-    const port = parts.length > 1 ? Number(parts.pop()) : 443;
-    const addr = parts.join(":");
-    const tlsOpt = tls === 'notls' ? 'security=none' : 'security=tls';
-    return `${转码}${转码2}${符号}${cfg.UUID}@${addr}:${port}?encryption=none&${tlsOpt}&sni=${host}&type=ws&host=${host}&path=%2F%3Fed%3D2560#${name}`;
-  }).join("\n");
-}
+  },
+};
