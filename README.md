@@ -115,10 +115,6 @@ https://your-worker-subdomain.workers.dev/123456/vless
 * ✅ Shadowrocket / Stash（iOS）
 * ✅ Clash.Meta（全平台）
 
-### 3. 多个用户如何使用？
-
-可拓展为 **多 UUID 支持**，目前需部署多个 Worker 实例分别设置不同 UUID。
-
 ---
 
 ## 📦 附加说明
@@ -128,22 +124,5 @@ https://your-worker-subdomain.workers.dev/123456/vless
 若你不使用订阅转换服务（如 Sub-Converter），此脚本可直接生成标准 VLESS 链接。
 
 也可将 `TXT` 变量设置为你的订阅 JSON 内容或自定义文本返回。
-
----
-
-## 🧩 高级拓展建议
-
-* ✅ 多 UUID 多用户支持
-* ✅ Fallback 路由分流机制
-* ✅ WARP / SOCKS5 出口集成
-* ✅ 自定义路径 & Anti-Replay 支持
-
-如需定制功能，可基于该框架继续扩展。
-
----
-
-## 📮 联系 & 反馈
-
-如需协助调试、优化或部署脚本支持更多功能，可直接联系维护者或提交 Issue。
 
 ---
